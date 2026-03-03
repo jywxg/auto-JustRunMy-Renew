@@ -1,51 +1,80 @@
-name: JustRunMy Auto Renew
-
+name: JustRunMy 自动续期
 on:
-  # 定时任务：每天 UTC 时间凌晨 2 点运行 (北京时间上午 10 点)
+  workflow_dispatch:
   schedule:
-    - cron: '0 2 */2 * *'
-  # 允许在 GitHub 网页端手动点击按钮触发
-  workflow_dispatch: 
-
+    - cron: '0 1 */2 * *'   # 每天北京时间 09:00（UTC 01:00）
 jobs:
   renew:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: write
     steps:
-      - name: Checkout Code
+      - name: 📥 下载代码
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-
-      - name: Install System Dependencies (Xvfb & xdotool)
+          python-version: '3.11'
+          
+      - name: 🛡️ 启动 Gost 代理转发
+        # 从 Secrets 读取代理配置，防止 IP 和密码泄露
+        env:
+          GOST_PROXY_TARGET: ${{ secrets.GOST_PROXY_TARGET }}
+        run: |
+          if [ -z "$GOST_PROXY_TARGET" ]; then
+            echo "❌ 错误: 未设置 GOST_PROXY_TARGET secret"
+            exit 1
+          fi
+          wget -q https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz
+          gunzip gost-linux-amd64-2.11.5.gz
+          chmod +x gost-linux-amd64-2.11.5
+          mv gost-linux-amd64-2.11.5 gost
+          echo "启动 Gost 转发隧道..."
+          # 使用环境变量替换硬编码的 proxy url
+          nohup ./gost -L http://:8080 -F $GOST_PROXY_TARGET > gost.log 2>&1 &
+          sleep 3
+          echo "测试本地代理连通性..."
+          curl -x http://127.0.0.1:8080 https://api.ipify.org -v
+          
+      - name: 🛠️ 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xdotool xvfb dbus-x11
-
-      - name: Install Python Dependencies
+          sudo apt-get install -y \
+            xvfb \
+            x11-utils \
+            xdotool \
+            scrot \
+            fonts-noto-cjk
+            
+      - name: 🐍 安装 Python 依赖
         run: |
-          python -m pip install --upgrade pip
-          pip install seleniumbase
-          # SeleniumBase 自带下载浏览器的功能，但手动装一下以防万一
-          seleniumbase install chromedriver 
-
-      - name: Run Renew Script
+          pip install seleniumbase aiohttp
+          seleniumbase install chromedriver
+          
+      - name: 🚀 运行续期脚本
+        # 从 Secrets 将账号密码传递给 Python 脚本的环境变量
         env:
           JUSTRUNMY_EMAIL: ${{ secrets.JUSTRUNMY_EMAIL }}
           JUSTRUNMY_PASSWORD: ${{ secrets.JUSTRUNMY_PASSWORD }}
-          JUSTRUNMY_APP_NAME: ${{ secrets.JUSTRUNMY_APP_NAME }}
-          JUSTRUNMY_PROXY: ${{ secrets.JUSTRUNMY_PROXY }}
         run: |
-          # 使用 xvfb-run 启动虚拟显示器，分辨率设为 1080p
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 justrunmy_renew.py
-
-      - name: Upload Screenshots on Failure
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python justrunmy_renew.py
+            
+      - name: 📸 上传调试截图
+        if: always()
         uses: actions/upload-artifact@v4
-        if: always() # 无论成功还是失败，都收集截图以便排错
         with:
           name: debug-screenshots
-          path: ./*.png
-          retention-days: 3 # 截图保留 3 天
+          path: "*.png"
+          retention-days: 3
+          
+      - name: 🧹 清理旧的工作流运行记录
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
