@@ -290,10 +290,44 @@ def login(sb) -> bool:
         if sb.get_current_url().split('?')[0].lower() != LOGIN_URL.lower():
             break
 
-    if sb.get_current_url().split('?')[0].lower() != LOGIN_URL.lower():
+    # 检查是否有登录错误信息
+    error_msg = None
+    try:
+        error_elements = sb.find_elements("div.validation-summary-errors li")
+        if error_elements:
+            error_msg = error_elements[0].text
+            print(f"❌ 登录错误: {error_msg}")
+    except Exception:
+        pass
+
+    # 检查是否成功登录
+    current_url = sb.get_current_url().split('?')[0].lower()
+    print(f"🔗 检查登录状态 - 当前 URL: {current_url}", flush=True)
+
+    # 优先级 1: 服务器错误信息
+    if error_msg:
+        print(f"❌ 登录失败: {error_msg}")
+        sb.save_screenshot("login_failed.png")
+        return False
+    
+    # 优先级 2: 检查是否仍在登录页面
+    elif "/id/account/loginemail" in current_url or "/login" in current_url:
+        try:
+            sb.find_element('input[name="Email"]')
+            print("❌ 登录失败，页面未跳转")
+            sb.save_screenshot("login_failed.png")
+            return False
+        except Exception:
+            print("❌ 登录失败，仍在登录页面")
+            sb.save_screenshot("login_failed.png")
+            return False
+    
+    # 最终检查：如果 URL 中不包含登录路径，视为成功
+    if "/id/account/loginemail" not in current_url and "/login" not in current_url:
         print("✅ 登录成功！")
+        sb.save_screenshot("login_success.png")
         return True
-        
+    
     print("❌ 登录失败，页面没有跳转。")
     sb.save_screenshot("login_failed.png")
     return False
