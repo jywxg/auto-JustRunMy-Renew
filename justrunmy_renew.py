@@ -4,8 +4,13 @@
 import os
 import sys
 import time
+import json
+import socket
+import signal
 import subprocess
 import requests
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, parse_qs, unquote
 from seleniumbase import SB
 
 LOGIN_URL = "https://justrunmy.app/id/Account/Login"
@@ -18,6 +23,8 @@ EMAIL        = os.environ.get("JUSTRUNMY_EMAIL")
 PASSWORD     = os.environ.get("JUSTRUNMY_PASSWORD")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID")
+HY2_PROXY_URL = os.environ.get("HY2_PROXY_URL", "").strip()
+SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "51080"))
 
 if not EMAIL or not PASSWORD:
     print("❌ 致命错误：未找到 JUSTRUNMY_EMAIL 或 JUSTRUNMY_PASSWORD 环境变量！")
@@ -28,9 +35,106 @@ if not EMAIL or not PASSWORD:
 DYNAMIC_APP_NAME = "未知应用"
 
 # ============================================================
+#  代理管理模块 (Hysteria2 -> SOCKS5)
+# ============================================================
+class Hy2Proxy:
+    def __init__(self, url):
+        self.url = url
+        self.proc = None
+
+    def start(self):
+        if not self.url:
+            return False
+        print("📡 启动 Hysteria2...")
+        
+        u = self.url.replace("hysteria2://", "").replace("hy2://", "")
+        parsed = urlparse("scheme://" + u)
+        params = parse_qs(parsed.query)
+        hostname = parsed.hostname
+        port = parsed.port
+        
+        if hostname and ':' in hostname:
+            server = f"[{hostname}]:{port}"
+        else:
+            server = f"{hostname}:{port}"
+
+        cfg = {
+            "server": server,
+            "auth": unquote(parsed.username) if parsed.username else "",
+            "tls": {
+                "sni": params.get("sni", [hostname])[0],
+                "insecure": params.get("insecure", ["0"])[0] == "1",
+                "alpn": params.get("alpn", ["h3"])[0],
+            },
+            "socks5": {"listen": f"127.0.0.1:{SOCKS_PORT}"}
+        }
+
+        path = "/tmp/hy2.json"
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+
+        self.proc = subprocess.Popen(
+            ["hysteria", "client", "-c", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            text=True
+        )
+
+        for _ in range(30):
+            time.sleep(1)
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", SOCKS_PORT)) == 0:
+                    print("✅ HY2 已就绪")
+                    return True
+        return False
+
+    def stop(self):
+        if self.proc:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+        print("🛑 HY2 已停止")
+
+    @property
+    def proxy(self):
+        return f"socks5://127.0.0.1:{SOCKS_PORT}"
+
+
+def get_proxy_manager():
+    if HY2_PROXY_URL:
+        return Hy2Proxy(HY2_PROXY_URL)
+    return None
+
+
+def start_proxy_with_retry(max_retries=3):
+    """启动代理，失败时重试"""
+    proxy_manager = get_proxy_manager()
+    proxy_url = None
+    
+    if not proxy_manager:
+        return None, None
+    
+    for attempt in range(1, max_retries + 1):
+        print(f"🔄 尝试启动代理 ({attempt}/{max_retries})...")
+        if proxy_manager.start():
+            proxy_url = proxy_manager.proxy
+            print(f"✅ 代理已启动：{proxy_url}")
+            return proxy_manager, proxy_url
+        else:
+            if attempt < max_retries:
+                print(f"⏳ 等待 5 秒后重试...")
+                time.sleep(5)
+            else:
+                print("⚠️ 代理启动失败，继续使用直连模式")
+    
+    return None, None
+
+# ============================================================
 #  Telegram 推送模块
 # ============================================================
-def send_tg_message(status_icon, status_text, time_left):
+def send_tg_message(status_icon, status_text, time_left, ipinfo="未知", start_time=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
         return
@@ -38,13 +142,22 @@ def send_tg_message(status_icon, status_text, time_left):
     # 获取北京时间 (UTC+8)
     local_time = time.gmtime(time.time() + 8 * 3600)
     current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+    
+    # 计算执行时长
+    duration = ""
+    if start_time:
+        elapsed = time.time() - start_time
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        duration = f"\n⏱️ 执行耗时: {minutes}m {seconds}s"
 
     # 按照格式拼接消息，动态注入抓取到的应用名称
     text = (
         f"justrunmy.app 续期报告\n🖥 {DYNAMIC_APP_NAME}\n"
         f"{status_icon} {status_text}\n"
         f"⏱️ 剩余: {time_left}\n"
-        f"时间: {current_time_str}"
+        f"🌐 IP: {ipinfo}\n"
+        f"时间: {current_time_str}{duration}"
     )
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -304,13 +417,13 @@ def login(sb) -> bool:
 # ============================================================
 #  自动续期模块 (动态抓取名称 + TG 通知)
 # ============================================================
-def renew(sb) -> bool:
+def renew(sb, ipinfo="未知", start_time=None) -> bool:
     global DYNAMIC_APP_NAME
-    
+
     print("\n" + "="*50)
     print("   🚀 开始自动续期流程")
     print("="*50)
-    
+
     print("🌐 进入控制面板: https://justrunmy.app/panel")
     sb.open("https://justrunmy.app/panel")
     time.sleep(3)
@@ -322,16 +435,16 @@ def renew(sb) -> bool:
     except Exception as e:
         print(f"❌ 找不到应用卡片: {e}")
         sb.save_screenshot("renew_app_not_found.png")
-        send_tg_message("❌", "续期失败(找不到应用)", "未知")
+        send_tg_message("❌", "续期失败(找不到应用)", "未知", ipinfo, start_time)
         return False
 
     # 获取所有 h3.font-semibold 元素的数量
     app_count = sb.execute_script("return document.querySelectorAll('h3.font-semibold').length")
-    print(f"� 检测到 {app_count} 个应用需要续期")
-    
+    print(f"📊 检测到 {app_count} 个应用需要续期")
+
     if app_count == 0:
         print("❌ 没有找到任何应用")
-        send_tg_message("❌", "续期失败(没有应用)", "未知")
+        send_tg_message("❌", "续期失败(没有应用)", "未知", ipinfo, start_time)
         return False
 
     # 逐个处理每个应用
@@ -339,24 +452,24 @@ def renew(sb) -> bool:
         print(f"\n{'='*50}")
         print(f"   处理第 {i+1}/{app_count} 个应用")
         print(f"{'='*50}")
-        
+
         # 返回到控制面板
         if i > 0:
-            print(" 返回控制面板...")
+            print("🔙 返回控制面板...")
             sb.open("https://justrunmy.app/panel")
             time.sleep(3)
-        
+
         try:
             # 重新获取所有元素并点击第 i 个
             app_elements = sb.execute_script("return document.querySelectorAll('h3.font-semibold')")
             if i >= len(app_elements):
                 print(f"⚠️ 应用数量已变化，跳过第 {i+1} 个")
                 continue
-            
+
             # 获取应用名称
             DYNAMIC_APP_NAME = sb.get_text(f'h3.font-semibold:nth-of-type({i+1})')
             print(f"🎯 应用名称: {DYNAMIC_APP_NAME}")
-            
+
             # 点击该应用
             sb.click(f'h3.font-semibold:nth-of-type({i+1})')
             time.sleep(3)
@@ -367,7 +480,7 @@ def renew(sb) -> bool:
             continue
 
         # 点击 Reset Timer 按钮
-        print("� 点击 Reset Timer 按钮...")
+        print("🖱️ 点击 Reset Timer 按钮...")
         try:
             sb.click('button:contains("Reset Timer")')
             time.sleep(3)
@@ -391,7 +504,7 @@ def renew(sb) -> bool:
         try:
             sb.click('button:contains("Just Reset")')
             print("⏳ 提交续期请求，等待服务器处理...")
-            time.sleep(5) 
+            time.sleep(5)
         except Exception as e:
             print(f"❌ 找不到 Just Reset 按钮: {e}")
             sb.save_screenshot(f"renew_app_{i+1}_just_reset_not_found.png")
@@ -404,15 +517,15 @@ def renew(sb) -> bool:
             time.sleep(4)
             timer_text = sb.get_text('span.font-mono.text-xl')
             print(f"⏱️ 当前应用剩余时间: {timer_text}")
-            
+
             if "2 days 23" in timer_text or "3 days" in timer_text:
                 print(f"✅ 应用 {i+1} 续期完成！")
                 sb.save_screenshot(f"renew_app_{i+1}_success.png")
-                send_tg_message("✅", f"续期完成 ({DYNAMIC_APP_NAME})", timer_text)
+                send_tg_message("✅", f"续期完成 ({DYNAMIC_APP_NAME})", timer_text, ipinfo, start_time)
             else:
                 print(f"⚠️ 应用 {i+1} 倒计时似乎没有重置到最高值")
                 sb.save_screenshot(f"renew_app_{i+1}_warning.png")
-                send_tg_message("⚠️", f"续期异常 ({DYNAMIC_APP_NAME})", timer_text)
+                send_tg_message("⚠️", f"续期异常 ({DYNAMIC_APP_NAME})", timer_text, ipinfo, start_time)
         except Exception as e:
             print(f"⚠️ 读取应用 {i+1} 倒计时失败: {e}")
             sb.save_screenshot(f"renew_app_{i+1}_timer_read_fail.png")
@@ -429,30 +542,44 @@ def main():
     print("=" * 50)
     print("   JustRunMy.app 自动登录与续期脚本")
     print("=" * 50)
-    
-    use_proxy = os.environ.get("USE_PROXY", "false").lower() == "true"
+
+    # 记录开始时间
+    start_time = time.time()
+
+    # 启动代理
+    proxy_manager, proxy_url = start_proxy_with_retry(max_retries=3)
+
     sb_kwargs = {"uc": True, "test": True, "headless": False}
-    
-    if use_proxy:
-        proxy_str = "http://127.0.0.1:8080"
-        print(f"🔗 挂载 Gost 代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
+
+    if proxy_url:
+        print(f"🔗 挂载 Hysteria2 代理: {proxy_url}")
+        sb_kwargs["proxy"] = proxy_url
     else:
         print("🌐 未使用代理，直连访问")
-    
+
     with SB(**sb_kwargs) as sb:
         print("✅ 浏览器已启动")
+
+        # 获取 IP 信息
+        ipinfo = "未知"
         try:
             sb.open("https://api.ipify.org/?format=json")
-            print(f"🌐 当前出口真实 IP: {sb.get_text('body')}")
-        except Exception:
-            pass
+            ipinfo = sb.get_text('body')
+            print(f"🌐 当前出口真实 IP: {ipinfo}")
+        except Exception as e:
+            print(f"⚠️ 获取 IP 信息失败: {e}")
 
         if login(sb):
-            renew(sb)
+            renew(sb, ipinfo, start_time)
         else:
             print("\n❌ 登录环节失败，终止后续续期操作。")
-            send_tg_message("❌", "登录失败", "未知")
+            send_tg_message("❌", "登录失败", "未知", ipinfo, start_time)
+
+    if proxy_manager:
+        proxy_manager.stop()
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
